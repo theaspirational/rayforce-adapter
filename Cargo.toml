@@ -1,0 +1,15 @@
+[package]
+name = "rayforce-adapter"
+version = "0.1.0"
+edition = "2021"
+description = "Rayforce splayed-table persistence adapter for ray-datom and ray-transactor."
+license = "MIT"
+
+[dependencies]
+ray-datom = { path = "../ray-datom" }
+ray-transactor = { path = "../ray-transactor" }
+libc = "0.2"
+serde_json = "1"
+thiserror = "1"
+
+[build-dependencies]
