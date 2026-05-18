@@ -10,7 +10,7 @@ use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::slice;
 
-use ray_datom::datom_store::Datom;
+use ray_datom::datom_store::{Datom, DatomStore};
 use ray_datom::tx::{ActorKind, PrincipalId, Tx, TxId};
 use ray_datom::value::Value;
 use ray_transactor::{CommitEnvelope, Projection, TransactorError};
@@ -106,9 +106,15 @@ impl TxLogLayout {
 /// append. That is intentionally simple and mirrors the early Rayforce app
 /// persistence path; applications can later swap in incremental table updates
 /// without changing the transactor boundary.
+///
+/// In addition to the on-disk splayed tables, the projection keeps an
+/// in-memory `DatomStore` populated from every committed envelope so callers
+/// can serve entity reads in O(filter) instead of replaying the envelope log
+/// per request.
 pub struct SplayedTxLogProjection {
     layout: TxLogLayout,
     envelopes: Vec<CommitEnvelope>,
+    store: DatomStore,
 }
 
 impl SplayedTxLogProjection {
@@ -118,6 +124,7 @@ impl SplayedTxLogProjection {
         Ok(Self {
             layout,
             envelopes: Vec::new(),
+            store: DatomStore::new(),
         })
     }
 
@@ -125,7 +132,15 @@ impl SplayedTxLogProjection {
         ensure_sym_init()?;
         layout.ensure()?;
         let envelopes = load_envelopes(&layout)?;
-        Ok(Self { layout, envelopes })
+        let mut store = DatomStore::new();
+        for envelope in &envelopes {
+            store.extend(envelope.datoms.iter().cloned());
+        }
+        Ok(Self {
+            layout,
+            envelopes,
+            store,
+        })
     }
 
     pub fn layout(&self) -> &TxLogLayout {
@@ -134,6 +149,13 @@ impl SplayedTxLogProjection {
 
     pub fn envelopes(&self) -> &[CommitEnvelope] {
         &self.envelopes
+    }
+
+    /// Borrow the in-memory `DatomStore` materialized from every envelope
+    /// committed through this projection. Stable across restarts because
+    /// `open` rehydrates it from the splayed tables.
+    pub fn store(&self) -> &DatomStore {
+        &self.store
     }
 
     pub fn rebuild(&self) -> Result<(), RayforceAdapterError> {
@@ -234,6 +256,7 @@ pub fn load_envelopes(layout: &TxLogLayout) -> Result<Vec<CommitEnvelope>, Rayfo
 
 impl Projection for SplayedTxLogProjection {
     fn append_envelope(&mut self, envelope: &CommitEnvelope) -> Result<(), TransactorError> {
+        self.store.extend(envelope.datoms.iter().cloned());
         self.envelopes.push(envelope.clone());
         self.rebuild()
             .map_err(|err| TransactorError::Projection(err.to_string()))
@@ -631,6 +654,103 @@ mod tests {
         assert_eq!(loaded[0].tx.metadata["source"], "test");
         assert_eq!(loaded[0].datoms.len(), 1);
         assert_eq!(loaded[0].datoms[0].entity, EntityId::new("task/T1"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn store_hydrates_from_envelopes_on_open() {
+        let root = std::env::temp_dir().join(format!(
+            "rayforce-adapter-store-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let layout = TxLogLayout::new(&root);
+
+        // Two envelopes: a create that asserts a title and a state, then an
+        // update that retracts the old state and asserts a new one. The
+        // application is responsible for emitting the retraction — the store
+        // is set-semantics; we test that hydration faithfully reproduces the
+        // log under that contract.
+        let mut projection = SplayedTxLogProjection::new(layout.clone()).unwrap();
+        let env1 = CommitEnvelope::new(
+            Tx::new(
+                TxId(1),
+                "2026-05-17T00:00:00Z",
+                PrincipalId::new("principal/alice"),
+                ActorKind::Human,
+                "task.create",
+            ),
+            vec![
+                Datom::add(
+                    EntityId::new("task/T1"),
+                    "task/title",
+                    Value::str("T1"),
+                    TxId(1),
+                ),
+                Datom::add(
+                    EntityId::new("task/T1"),
+                    "task/state",
+                    Value::sym("open"),
+                    TxId(1),
+                ),
+            ],
+        );
+        let env2 = CommitEnvelope::new(
+            Tx::new(
+                TxId(2),
+                "2026-05-17T00:00:01Z",
+                PrincipalId::new("principal/alice"),
+                ActorKind::Human,
+                "task.update",
+            ),
+            vec![
+                Datom::retract(
+                    EntityId::new("task/T1"),
+                    "task/state",
+                    Value::sym("open"),
+                    TxId(2),
+                ),
+                Datom::add(
+                    EntityId::new("task/T1"),
+                    "task/state",
+                    Value::sym("done"),
+                    TxId(2),
+                ),
+            ],
+        );
+        projection.append_envelope(&env1).unwrap();
+        projection.append_envelope(&env2).unwrap();
+
+        let title_key = (
+            EntityId::new("task/T1"),
+            "task/title".to_string(),
+            Value::str("T1"),
+        );
+        let state_done_key = (
+            EntityId::new("task/T1"),
+            "task/state".to_string(),
+            Value::sym("done"),
+        );
+
+        // Live projection should have title still present and state == done.
+        let live = projection.store().current();
+        assert!(live.contains(&title_key));
+        assert!(live.contains(&state_done_key));
+        assert_eq!(live.len(), 2, "live current() should have exactly 2 facts");
+
+        // Reopened projection rehydrates the store from the splayed tables;
+        // current() must yield the same set of facts as the live projection.
+        let reopened = SplayedTxLogProjection::open(layout).unwrap();
+        let reloaded = reopened.store().current();
+        assert!(reloaded.contains(&title_key));
+        assert!(reloaded.contains(&state_done_key));
+        assert_eq!(
+            reloaded.len(),
+            live.len(),
+            "reloaded current() must equal live current()"
+        );
+        assert_eq!(reopened.store().len(), projection.store().len());
 
         let _ = std::fs::remove_dir_all(&root);
     }
